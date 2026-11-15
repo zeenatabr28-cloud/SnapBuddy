@@ -1,0 +1,11 @@
+Plotted to 'C:\Users\zeena\OneDrive\Desktop\SnapBuddy\SnapBuddyPCB\SnapBuddyPCB-F_Cu.gbr'.
+Plotted to 'C:\Users\zeena\OneDrive\Desktop\SnapBuddy\SnapBuddyPCB\SnapBuddyPCB-B_Cu.gbr'.
+Plotted to 'C:\Users\zeena\OneDrive\Desktop\SnapBuddy\SnapBuddyPCB\SnapBuddyPCB-F_Paste.gbr'.
+Plotted to 'C:\Users\zeena\OneDrive\Desktop\SnapBuddy\SnapBuddyPCB\SnapBuddyPCB-B_Paste.gbr'.
+Plotted to 'C:\Users\zeena\OneDrive\Desktop\SnapBuddy\SnapBuddyPCB\SnapBuddyPCB-F_Silkscreen.gbr'.
+Plotted to 'C:\Users\zeena\OneDrive\Desktop\SnapBuddy\SnapBuddyPCB\SnapBuddyPCB-B_Silkscreen.gbr'.
+Plotted to 'C:\Users\zeena\OneDrive\Desktop\SnapBuddy\SnapBuddyPCB\SnapBuddyPCB-F_Mask.gbr'.
+Plotted to 'C:\Users\zeena\OneDrive\Desktop\SnapBuddy\SnapBuddyPCB\SnapBuddyPCB-B_Mask.gbr'.
+Plotted to 'C:\Users\zeena\OneDrive\Desktop\SnapBuddy\SnapBuddyPCB\SnapBuddyPCB-Edge_Cuts.gbr'.
+Created Gerber job file 'C:\Users\zeena\OneDrive\Desktop\SnapBuddy\SnapBuddyPCB\SnapBuddyPCB-job.gbrjob'.
+Info: Done.
