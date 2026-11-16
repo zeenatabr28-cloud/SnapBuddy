@@ -9,6 +9,7 @@
 #include "nvs.h"
 #include "shared.h"
 #include "c_shims.h"
+#include "img_converters.h"
 
 /* Compile-time RGB565 helper for static const C initializers */
 #define COLOR565(r, g, b) \
@@ -63,25 +64,25 @@ SDStatus globalSDState = {false, false, "NO CARD"};
 CameraSettings camSettings = { 1, 0, 2, 0, 0, 0, 1, 0, 12, 10, 0, 0, 0, 5 };
 camera_config_t config;
 int pictureNumber = 0;
+/* Video removed — kept as zero/NULL placeholders only if declared extern in shared.h */
 int videoNumber = 0;
 unsigned long recordingStartTime = 0;
 sd_file_t *videoFile = NULL;
 TaskHandle_t taskDisplayHandle = NULL;
 
-/* Display double buffer */
+/* Display buffer (single DRAM buffer on ESP32-WROOM-32 without PSRAM) */
 uint8_t *dispBuf[2] = {NULL, NULL};
 volatile size_t dispLen[2] = {0, 0};
+static size_t dispBufCap = 0;
 atomic_int dispWriteSlot = 0;
 atomic_int dispReadSlot = -1;
 atomic_int dispRendering = -1;
 
-/* Recorder pool */
+/* Unused video/audio placeholders for shared.h extern compatibility (zero RAM allocated) */
 uint8_t *recPool[REC_POOL_SIZE] = {NULL, NULL, NULL};
 QueueHandle_t recFrameQueue = NULL;
 SemaphoreHandle_t recPoolFree = NULL;
 int recPoolWriteIdx = 0;
-
-/* Audio */
 int16_t *audioRecBuf = NULL;
 i2s_chan_handle_t i2s_rx_handle = NULL;
 
@@ -118,7 +119,6 @@ volatile uint32_t dbgEncLong  = 0;
 static void taskSDMonitor(void *pvParameters);
 static void taskCapture(void *pvParameters);
 static void taskDisplay(void *pvParameters);
-static void taskRecorder(void *pvParameters);
 static void taskInput(void *pvParameters);
 static void sendInputEvent(InputEventType t);
 static void savePhotoHighRes(void);
@@ -126,8 +126,10 @@ static void drawStatusBar(float fps);
 static void encoderISR(void);
 static void encSwISR(void);
 static void runTimelapse(void);
+static void runSlideshow(void);
 static void runSelfTimerCountdown(void);
 static void runBootAnimation(void);
+static uint8_t ov7670_jpeg_quality(int cam_quality);
 
 /* ================= SETUP ================= */
 void setup(void) {
@@ -145,7 +147,7 @@ void setup(void) {
   pinMode(SHUTTER_BTN_PIN_2, INPUT_PULLUP);
 
   /* LED flashlight output (GPIO4). Always starts OFF — the LED only activates */
-  /* during photo capture or video recording, never in idle or menus. */
+  /* during photo capture, never in idle or menus. */
   pinMode(LED_FLASHLIGHT_PIN, OUTPUT);
   digitalWrite(LED_FLASHLIGHT_PIN, LOW);
 
@@ -156,8 +158,6 @@ void setup(void) {
   spiMutex = xSemaphoreCreateMutex();
   appEvents = xEventGroupCreate();
   inputEventQueue = xQueueCreate(16, sizeof(InputEvent));
-  recFrameQueue = xQueueCreate(REC_POOL_SIZE, sizeof(RecFrame));
-  recPoolFree = xSemaphoreCreateCounting(REC_POOL_SIZE, REC_POOL_SIZE);
 
   spi_begin(TFT_SCK, TFT_MISO, TFT_MOSI, SD_CS_PIN);
   delay(100);
@@ -169,19 +169,18 @@ void setup(void) {
   /* Boot animation — retro first impression before hardware init */
   runBootAnimation();
 
-  /* Load file counters from NVS */
+  /* Load photo counter from NVS */
   pictureNumber = (int)nvs_read_i32("cnt", "pic", 0);
-  videoNumber   = (int)nvs_read_i32("cnt", "vid", 0);
 
   /* Load camera settings from NVS */
   loadCameraSettings();
 
-  /* Build EXIF metadata block (cached in PSRAM for all photo saves) */
+  /* Build EXIF metadata block */
   buildExifBlock();
 
-  serial_printf("Initial image no: %d, video no: %d\n", pictureNumber, videoNumber);
+  serial_printf("Initial image no: %d\n", pictureNumber);
 
-  /* CAMERA CONFIG */
+  /* CAMERA CONFIG (ESP32-WROOM-32 + OV7670 V2) */
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
   config.pin_d0       = Y2_GPIO_NUM;
@@ -200,7 +199,8 @@ void setup(void) {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  /* OV7670 V2 runs reliably at 10 MHz XCLK on ESP32 (20 MHz can cause PCLK/sync artifacts) */
+  config.xclk_freq_hz = 10000000;
 
   initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
 
@@ -214,14 +214,11 @@ void setup(void) {
   /* Task: Button/Input Handler (Core 0, Priority 2) */
   xTaskCreatePinnedToCore(taskInput, "Input", 4096, NULL, 2, NULL, 0);
 
-  /* Task: AVI Recorder / SD Writer (Core 0, Priority 4) */
-  xTaskCreatePinnedToCore(taskRecorder, "Recorder", 8192, NULL, 4, NULL, 0);
-
-  /* Task: TFT Display (Core 1, Priority 3) */
-  xTaskCreatePinnedToCore(taskDisplay, "Display", 16384, NULL, 3, &taskDisplayHandle, 1);
+  /* Task: TFT Display (Core 1, Priority 3) — sized for ESP32-WROOM-32 DRAM */
+  xTaskCreatePinnedToCore(taskDisplay, "Display", 10240, NULL, 3, &taskDisplayHandle, 1);
 
   /* Task: Camera Capture (Core 1, Priority 6 - highest) */
-  xTaskCreatePinnedToCore(taskCapture, "Capture", 8192, NULL, 6, NULL, 1);
+  xTaskCreatePinnedToCore(taskCapture, "Capture", 6144, NULL, 6, NULL, 1);
 
   /* Attach encoder interrupts AFTER tasks are created so the queue exists. */
   attachInterrupt(digitalPinToInterrupt(ENC_CLK), encoderISR, CHANGE);
@@ -229,7 +226,7 @@ void setup(void) {
   attachInterrupt(digitalPinToInterrupt(ENC_SW),  encSwISR,  CHANGE);
   serial_println("Encoder ISRs attached (CLK+DT+SW).");
 
-  serial_println("Cam is ready. Tasks launched.");
+  serial_println("Cam is ready (ESP32-WROOM-32 + OV7670 V2, photo-only). Tasks launched.");
 }
 
 /* ================= LOOP ================= */
@@ -237,30 +234,23 @@ void loop(void) {
   vTaskDelete(NULL);
 }
 
-/* ================= BUFFER ALLOCATION ================= */
+/* ================= BUFFER ALLOCATION (ESP32-WROOM-32 INTERNAL DRAM) ================= */
 void allocateBuffers(void) {
-  for (int i = 0; i < 2; i++) {
-    dispBuf[i] = (uint8_t *)ps_malloc(DISP_BUF_SIZE);
-    if (!dispBuf[i]) serial_printf("[ERR] dispBuf[%d] alloc failed!\n", i);
+  /* ESP32-WROOM-32 has no PSRAM: allocate a single display buffer in internal DRAM. */
+  dispBuf[0] = (uint8_t *)malloc(DISP_BUF_SIZE);
+  if (dispBuf[0]) {
+    dispBufCap = DISP_BUF_SIZE;
+  } else {
+    /* Fallback to QQVGA RGB565 buffer (38.4 KB) if DRAM cannot fit full QVGA */
+    size_t qqvgaBytes = 160U * 120U * 2U;
+    dispBuf[0] = (uint8_t *)malloc(qqvgaBytes);
+    dispBufCap = dispBuf[0] ? qqvgaBytes : 0;
+    if (!dispBuf[0]) serial_println("[ERR] dispBuf[0] alloc failed!");
   }
-  for (int i = 0; i < REC_POOL_SIZE; i++) {
-    recPool[i] = (uint8_t *)ps_malloc(REC_BUF_SIZE);
-    if (!recPool[i]) serial_printf("[ERR] recPool[%d] alloc failed!\n", i);
-  }
-  audioRecBuf = (int16_t *)ps_malloc(AUDIO_REC_BUF_SIZE);
-  if (!audioRecBuf) serial_println("[ERR] audioRecBuf alloc failed!");
+  dispBuf[1] = NULL;
 
-  /* AVI metadata arrays: allocated ONCE at boot to prevent PSRAM heap fragmentation. */
-  /* startAVI() only clears them with memset; endAVI() never frees them. */
-  avi_frame_sizes = (uint32_t *)ps_malloc(MAX_AVI_FRAMES * sizeof(uint32_t));
-  if (!avi_frame_sizes) serial_println("[ERR] avi_frame_sizes alloc failed!");
-  avi_audio_sizes = (uint32_t *)ps_malloc(MAX_AVI_FRAMES * sizeof(uint32_t));
-  if (!avi_audio_sizes) serial_println("[ERR] avi_audio_sizes alloc failed!");
-  avi_chunk_order = (uint8_t *)ps_malloc(MAX_AVI_CHUNKS);
-  if (!avi_chunk_order) serial_println("[ERR] avi_chunk_order alloc failed!");
-
-  serial_printf("[MEM] Free PSRAM after boot alloc: %u bytes\n",
-                (unsigned int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  serial_printf("[MEM] Free internal DRAM after boot alloc: %u bytes\n",
+                (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 }
 
 /* Centred transient message. Pausing taskDisplay during the hold is essential */
@@ -351,15 +341,6 @@ static void taskSDMonitor(void *pvParameters) {
       continue;
     }
 
-    /* During recording: skip SD polling entirely. SD removal and space */
-    /* exhaustion are caught by taskRecorder's write error path, which sends */
-    /* EVT_SD_STOP. Polling here would compete for spiMutex with the recorder */
-    /* on every cycle, reducing effective write throughput. */
-    if (appState == STATE_RECORDING || appState == STATE_STOPPING) {
-      vTaskDelay(pdMS_TO_TICKS(2000));
-      continue;
-    }
-
     if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
       bool currentMount = false;
       bool currentFull = false;
@@ -421,13 +402,10 @@ static void sendInputEvent(InputEventType t) {
  * All physical inputs are translated into InputEvent and pushed to inputEventQueue.
  * Encoder ISRs push CW/CCW/CLICK/LONG directly; shutter button is polled here.
  *
- * State machine:
- *   IDLE -> ENC_CLICK -> MENU_MAIN -> (Gallery | WiFi | Settings | Exit)
+ * State machine (Photo-only build for ESP32-WROOM-32 + OV7670 V2):
+ *   IDLE -> ENC_CLICK -> MENU_MAIN -> (Gallery | WiFi | Settings | Timelapse | Slideshow | Exit)
  *   ENC_LONG = universal "go back one level"
- *   SHUTTER short = photo (IDLE), stop recording, or emergency exit from any menu
- *   SHUTTER long  = start recording (from IDLE or any menu — auto-exits first)
- *
- * Boot button disabled in Phase 10 — mirror toggle and WiFi entry handled via encoder menu.
+ *   SHUTTER = take photo (IDLE), cancel self-timer, or emergency exit from any menu
  */
 static void taskInput(void *pvParameters) {
   (void)pvParameters;
@@ -444,109 +422,51 @@ static void taskInput(void *pvParameters) {
 
     /* ── SHUTTER release edge ── */
     if (lastShutter == LOW && shutterNow == HIGH) {
-      unsigned long dur = millis() - shutterPressTime;
-
-      if (dur < 1000) {
-        /* Short press */
-        if (appState == STATE_IDLE) {
-          /* Take photo — respect self-timer if configured */
-          bool canSave = false;
-          const char *errMsg = "";
-          if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-            if (!globalSDState.isMounted) errMsg = "NO SD CARD!";
-            else if (globalSDState.isFull)  errMsg = "SD FULL!";
-            else canSave = true;
-            xSemaphoreGive(spiMutex);
-          }
-          if (canSave) {
-            if (camSettings.selftimer_seconds > 0) {
-              /* Intercept: show countdown, then fire the photo at 0. */
-              /* taskDisplay will call runSelfTimerCountdown() which sends EVT_TAKE_PHOTO. */
-              appState = STATE_SELFTIMER_COUNTDOWN;
-              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
-            } else {
-              xEventGroupSetBits(appEvents, EVT_TAKE_PHOTO);
-              sendInputEvent(INPUT_BTN_SHORT);
-            }
-          } else {
-            showTFTMessage(errMsg, TFT_RED, 2000);
-          }
-        } else if (appState == STATE_SELFTIMER_COUNTDOWN) {
-          /* Shutter press during countdown cancels it */
-          appState = STATE_IDLE;
-        } else if (appState == STATE_RECORDING && millis() - recordingStartTime > 2000) {
-          /* Stop recording */
-          xEventGroupSetBits(appEvents, EVT_STOP_RECORDING);
-          sendInputEvent(INPUT_BTN_SHORT);
-        } else if (appState == STATE_TIMELAPSE) {
-          /* Safe exit: use intermediate state so runTimelapse() handles camera cleanup. */
-          /* Don't call emergencyExitToIdle() — it would race with camera ops in runTimelapse. */
-          appState = STATE_MENU_MAIN;
-        } else if (appState == STATE_SLIDESHOW) {
-          /* Slideshow: short press = emergency exit to IDLE (reinit camera, same as other menus). */
-          /* runSlideshow() in taskDisplay detects the state change and exits its loop cleanly. */
-          emergencyExitToIdle();
-        } else if (appState == STATE_MENU_MAIN || appState == STATE_SETTINGS ||
-                   appState == STATE_GALLERY_TYPE || appState == STATE_GALLERY_PHOTOS ||
-                   appState == STATE_GALLERY_VIDEOS || appState == STATE_DELETE_CONFIRM ||
-                   appState == STATE_VIDEO_PLAYING ||
-                   appState == STATE_GALLERY_PHOTO_VIEW || appState == STATE_GALLERY_VIDEO_VIEW) {
-          /* Emergency exit from any gallery/menu state -> IDLE */
-          emergencyExitToIdle();
-        }
-      }
-      /* Long press released: timelapse needs explicit cleanup; slideshow handled via isMenu below */
-      else if (appState == STATE_TIMELAPSE) {
-        appState = STATE_MENU_MAIN;
-      }
-      /* Other long presses handled by held detection below */
-    }
-
-    /* ── SHUTTER held long (>1s) -> start recording ── */
-    /* Works from IDLE or any gallery state (exits gallery first, reinits camera) */
-    {
-      AppState cs = appState;
-      bool isMenu = (cs == STATE_MENU_MAIN || cs == STATE_SETTINGS ||
-                     cs == STATE_GALLERY_TYPE || cs == STATE_GALLERY_PHOTOS ||
-                     cs == STATE_GALLERY_VIDEOS || cs == STATE_DELETE_CONFIRM ||
-                     cs == STATE_VIDEO_PLAYING || cs == STATE_SLIDESHOW ||
-                     cs == STATE_GALLERY_PHOTO_VIEW || cs == STATE_GALLERY_VIDEO_VIEW);
-      if (shutterNow == LOW && (cs == STATE_IDLE || isMenu) &&
-          (millis() - shutterPressTime > 1000) && shutterPressTime != 0) {
-        /* Exit menu/gallery first if needed */
-        if (isMenu) {
-          serial_println("[MENU] Shutter long press -> exit menu, start recording");
-          emergencyExitToIdle();
-        }
-
-        bool cardReady = false;
-        const char *errorMsg = "";
+      (void)shutterPressTime;
+      if (appState == STATE_IDLE) {
+        /* Take photo — respect self-timer if configured */
+        bool canSave = false;
+        const char *errMsg = "";
         if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-          if (!globalSDState.isMounted) errorMsg = "NO SD CARD!";
-          else if (globalSDState.isFull)  errorMsg = "SD FULL!";
-          else cardReady = true;
+          if (!globalSDState.isMounted) errMsg = "NO SD CARD!";
+          else if (globalSDState.isFull)  errMsg = "SD FULL!";
+          else canSave = true;
           xSemaphoreGive(spiMutex);
         }
-        if (cardReady) {
-          sendInputEvent(INPUT_BTN_LONG);
-          xEventGroupSetBits(appEvents, EVT_START_RECORDING);
-          /* wait for state change to avoid re-trigger */
-          while (appState == STATE_IDLE && digitalRead(SHUTTER_BTN_PIN_2) == LOW) {
-            vTaskDelay(pdMS_TO_TICKS(50));
+        if (canSave) {
+          if (camSettings.selftimer_seconds > 0) {
+            /* Intercept: show countdown, then fire the photo at 0. */
+            /* taskDisplay will call runSelfTimerCountdown() which sends EVT_TAKE_PHOTO. */
+            appState = STATE_SELFTIMER_COUNTDOWN;
+            if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+          } else {
+            xEventGroupSetBits(appEvents, EVT_TAKE_PHOTO);
+            sendInputEvent(INPUT_BTN_SHORT);
           }
-          shutterPressTime = 0;  /* re-arm */
         } else {
-          showTFTMessage(errorMsg, TFT_RED, 2000);
-          shutterPressTime = 0;
+          showTFTMessage(errMsg, TFT_RED, 2000);
         }
+      } else if (appState == STATE_SELFTIMER_COUNTDOWN) {
+        /* Shutter press during countdown cancels it */
+        appState = STATE_IDLE;
+      } else if (appState == STATE_TIMELAPSE) {
+        /* Safe exit: use intermediate state so runTimelapse() handles camera cleanup. */
+        appState = STATE_MENU_MAIN;
+      } else if (appState == STATE_SLIDESHOW) {
+        emergencyExitToIdle();
+      } else if (appState == STATE_MENU_MAIN || appState == STATE_SETTINGS ||
+                 appState == STATE_GALLERY_PHOTOS || appState == STATE_DELETE_CONFIRM ||
+                 appState == STATE_GALLERY_PHOTO_VIEW) {
+        /* Emergency exit from any gallery/menu state -> IDLE */
+        emergencyExitToIdle();
       }
     }
 
     /* ── Process encoder events from ISR queue ── */
     /* Unified consumer: all encoder-based state transitions handled here. */
-    /* Skipped during video playback, timelapse, and slideshow — those modes consume events directly. */
-    if (appState != STATE_VIDEO_PLAYING && appState != STATE_TIMELAPSE &&
-        appState != STATE_SLIDESHOW && appState != STATE_SELFTIMER_COUNTDOWN) {
+    /* Skipped during timelapse, slideshow, and self-timer — those modes consume events directly. */
+    if (appState != STATE_TIMELAPSE && appState != STATE_SLIDESHOW &&
+        appState != STATE_SELFTIMER_COUNTDOWN) {
       InputEvent ev;
       while (xQueueReceive(inputEventQueue, &ev, 0) == pdTRUE) {
         if (ev.type != INPUT_ENC_CW && ev.type != INPUT_ENC_CCW &&
@@ -556,7 +476,6 @@ static void taskInput(void *pvParameters) {
           case STATE_IDLE:
             if (ev.type == INPUT_ENC_CLICK) {
               /* Menu is always accessible regardless of SD state. */
-              /* SD checks happen per-item (Gallery, WiFi) inside STATE_MENU_MAIN. */
               menuMainSelection = 0;
               enterMenuMain();
             }
@@ -573,7 +492,7 @@ static void taskInput(void *pvParameters) {
               if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
             } else if (ev.type == INPUT_ENC_CLICK) {
               switch (menuMainSelection) {
-                case 0: /* Gallery — requires SD */
+                case 0: /* Photo Gallery (video removed) — requires SD */
                   if (!globalSDState.isMounted) {
                     showTFTMessage("SD REQUIRED!", TFT_RED, 2000);
                     galleryNeedsRedraw = true;
@@ -581,8 +500,25 @@ static void taskInput(void *pvParameters) {
                     break;
                   }
                   galleryTypeSelection = 0;
-                  galleryNeedsRedraw = true;
-                  appState = STATE_GALLERY_TYPE;
+                  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+                    tft_fillRect(0, 200, 320, 20, TFT_BLACK);
+                    tft_setTextDatum(middle_center);
+                    tft_setTextSize(1);
+                    tft_setTextColor(TFT_YELLOW);
+                    tft_drawString("Scanning SD card...", tft_width() / 2, 210);
+                    tft_setTextDatum(top_left);
+                    xSemaphoreGive(spiMutex);
+                  }
+                  scanGalleryFiles(false);
+                  if (galleryFileCount > 0) {
+                    galleryIndex = 0;
+                    gridPage = 0;
+                    galleryNeedsRedraw = true;
+                    appState = STATE_GALLERY_PHOTOS;
+                  } else {
+                    showTFTMessage("NO PHOTOS FOUND", TFT_RED, 1500);
+                    galleryNeedsRedraw = true;
+                  }
                   if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
                   break;
                 case 1: /* WiFi — requires SD */
@@ -638,48 +574,6 @@ static void taskInput(void *pvParameters) {
             }
             break;
 
-          case STATE_GALLERY_TYPE:
-            if (ev.type == INPUT_ENC_CW || ev.type == INPUT_ENC_CCW) {
-              galleryTypeSelection = 1 - galleryTypeSelection;
-              galleryNeedsRedraw = true;
-              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
-            } else if (ev.type == INPUT_ENC_CLICK) {
-              if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-                tft_fillRect(0, 200, 320, 20, TFT_BLACK);
-                tft_setTextDatum(middle_center);
-                tft_setTextSize(1);
-                tft_setTextColor(TFT_YELLOW);
-                tft_drawString("Scanning SD card...", tft_width() / 2, 210);
-                tft_setTextDatum(top_left);
-                xSemaphoreGive(spiMutex);
-              }
-              scanGalleryFiles(galleryTypeSelection == 1);
-              if (galleryFileCount > 0) {
-                galleryIndex = 0;
-                gridPage = 0;
-                galleryNeedsRedraw = true;
-                appState = (galleryTypeSelection == 0) ? STATE_GALLERY_PHOTOS : STATE_GALLERY_VIDEOS;
-              } else {
-                if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-                  tft_fillRect(0, 200, 320, 20, TFT_BLACK);
-                  tft_setTextDatum(middle_center);
-                  tft_setTextSize(1);
-                  tft_setTextColor(TFT_RED);
-                  tft_drawString("No files found", tft_width() / 2, 210);
-                  tft_setTextDatum(top_left);
-                  xSemaphoreGive(spiMutex);
-                }
-              }
-              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
-            } else if (ev.type == INPUT_ENC_LONG) {
-              freeGalleryFiles();
-              galleryNeedsRedraw = true;
-              menuMainSelection = 0;
-              appState = STATE_MENU_MAIN;
-              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
-            }
-            break;
-
           case STATE_GALLERY_PHOTOS: {
             /* Grid view: cursor moves between cells, page changes trigger full redraw */
             if (ev.type == INPUT_ENC_CW || ev.type == INPUT_ENC_CCW) {
@@ -711,7 +605,8 @@ static void taskInput(void *pvParameters) {
             } else if (ev.type == INPUT_ENC_LONG) {
               freeGalleryFiles();
               galleryNeedsRedraw = true;
-              appState = STATE_GALLERY_TYPE;
+              menuMainSelection = 0;
+              appState = STATE_MENU_MAIN;
               if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
             }
             break;
@@ -745,80 +640,14 @@ static void taskInput(void *pvParameters) {
             }
             break;
 
-          case STATE_GALLERY_VIDEOS: {
-            /* Video grid view */
-            if (ev.type == INPUT_ENC_CW || ev.type == INPUT_ENC_CCW) {
-              int oldIdx = galleryIndex;
-              int oldPage = gridPage;
-              if (ev.type == INPUT_ENC_CW && galleryIndex < galleryFileCount - 1) {
-                galleryIndex++;
-              } else if (ev.type == INPUT_ENC_CCW && galleryIndex > 0) {
-                galleryIndex--;
-              }
-              gridPage = galleryIndex / GRID_ITEMS_PER_PAGE;
-              if (gridPage != oldPage) {
-                galleryNeedsRedraw = true;
-                if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
-              } else if (galleryIndex != oldIdx) {
-                int pageStart = gridPage * GRID_ITEMS_PER_PAGE;
-                int oldLocal = oldIdx - pageStart;
-                int newLocal = galleryIndex - pageStart;
-                clearGridCursor(oldLocal % GRID_COLS, oldLocal / GRID_COLS);
-                drawGridCursor(newLocal % GRID_COLS, newLocal / GRID_COLS, TFT_CYAN);
-              }
-            } else if (ev.type == INPUT_ENC_CLICK) {
-              /* Drill down to video detail view */
-              galleryNeedsRedraw = true;
-              appState = STATE_GALLERY_VIDEO_VIEW;
-              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
-            } else if (ev.type == INPUT_ENC_LONG) {
-              freeGalleryFiles();
-              galleryNeedsRedraw = true;
-              appState = STATE_GALLERY_TYPE;
-              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
-            }
-            break;
-          }
-
-          case STATE_GALLERY_VIDEO_VIEW:
-            /* Video detail view: CW/CCW = prev/next, CLICK = play, LONG = back to grid */
-            if (ev.type == INPUT_ENC_CW) {
-              if (galleryIndex < galleryFileCount - 1) {
-                galleryIndex++;
-                galleryNeedsRedraw = true;
-                if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
-              }
-            } else if (ev.type == INPUT_ENC_CCW) {
-              if (galleryIndex > 0) {
-                galleryIndex--;
-                galleryNeedsRedraw = true;
-                if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
-              }
-            } else if (ev.type == INPUT_ENC_CLICK) {
-              appState = STATE_VIDEO_PLAYING;
-              galleryNeedsRedraw = true;
-              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
-            } else if (ev.type == INPUT_ENC_LONG) {
-              gridPage = galleryIndex / GRID_ITEMS_PER_PAGE;
-              galleryNeedsRedraw = true;
-              appState = STATE_GALLERY_VIDEOS;
-              if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
-            }
-            break;
-
           case STATE_DELETE_CONFIRM:
             if (ev.type == INPUT_ENC_CW || ev.type == INPUT_ENC_CCW) {
               deleteSelection = 1 - deleteSelection;
               galleryNeedsRedraw = true;
               if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
             } else if (ev.type == INPUT_ENC_CLICK) {
-              if (galleryTypeSelection == 1 && deleteSelection == 0) {
-                /* Videos: "Play" selected */
-                appState = STATE_VIDEO_PLAYING;
-                galleryNeedsRedraw = true;
-                if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
-              } else if (deleteSelection == 1 && galleryFileCount > 0) {
-                /* Delete the file (photos or videos) */
+              if (deleteSelection == 1 && galleryFileCount > 0) {
+                /* Delete the photo */
                 bool ok = false;
                 if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
                   ok = sd_remove(galleryFiles[galleryIndex]);
@@ -833,43 +662,47 @@ static void taskInput(void *pvParameters) {
                   galleryFileCount--;
                   if (galleryIndex >= galleryFileCount && galleryIndex > 0) galleryIndex--;
                 }
-                /* Return to grid view (or type selector if empty) */
+                /* Return to grid view (or main menu if empty) */
                 if (galleryFileCount > 0) {
                   gridPage = galleryIndex / GRID_ITEMS_PER_PAGE;
-                  appState = (galleryTypeSelection == 0) ? STATE_GALLERY_PHOTOS : STATE_GALLERY_VIDEOS;
+                  appState = STATE_GALLERY_PHOTOS;
                 } else {
                   freeGalleryFiles();
-                  appState = STATE_GALLERY_TYPE;
+                  menuMainSelection = 0;
+                  appState = STATE_MENU_MAIN;
                 }
                 galleryNeedsRedraw = true;
                 if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
               } else {
-                /* Photos: "Cancel" selected (deleteSelection == 0) */
+                /* "Cancel" selected (deleteSelection == 0) */
                 appState = STATE_GALLERY_PHOTO_VIEW;
                 galleryNeedsRedraw = true;
                 if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
               }
             } else if (ev.type == INPUT_ENC_LONG) {
               /* Cancel — go back to detail view */
-              appState = (galleryTypeSelection == 0) ? STATE_GALLERY_PHOTO_VIEW : STATE_GALLERY_VIDEO_VIEW;
+              appState = STATE_GALLERY_PHOTO_VIEW;
               galleryNeedsRedraw = true;
               if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
             }
             break;
 
           case STATE_SETTINGS: {
-            /* Settings menu: browse or edit camera parameters */
+            /* Settings menu: browse or edit camera parameters (video setting index 10 removed) */
             if (!settingsEditing) {
               /* Browsing mode: CW/CCW move highlight, CLICK enters edit */
               if (ev.type == INPUT_ENC_CW) {
                 settingsIndex = (settingsIndex + 1) % SETTINGS_COUNT;
+                if (settingsIndex == 10) settingsIndex = (settingsIndex + 1) % SETTINGS_COUNT;
                 galleryNeedsRedraw = true;
                 if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
               } else if (ev.type == INPUT_ENC_CCW) {
                 settingsIndex = (settingsIndex + SETTINGS_COUNT - 1) % SETTINGS_COUNT;
+                if (settingsIndex == 10) settingsIndex = (settingsIndex + SETTINGS_COUNT - 1) % SETTINGS_COUNT;
                 galleryNeedsRedraw = true;
                 if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
               } else if (ev.type == INPUT_ENC_CLICK) {
+                if (settingsIndex == 10) break;
                 resetCounterConfirm = 0;  /* safety: always start at "No" */
                 settingsEditing = true;
                 galleryNeedsRedraw = true;
@@ -895,10 +728,8 @@ static void taskInput(void *pvParameters) {
                   if (resetCounterConfirm == 1) {
                     /* Execute counter reset */
                     pictureNumber = 0;
-                    videoNumber = 0;
                     nvs_write_i32("cnt", "pic", 0);
-                    nvs_write_i32("cnt", "vid", 0);
-                    serial_println("[NVS] File counters reset to 0.");
+                    serial_println("[NVS] Photo counter reset to 0.");
 
                     /* Show warning on TFT */
                     settingsEditing = false;
@@ -908,10 +739,10 @@ static void taskInput(void *pvParameters) {
                       tft_setTextDatum(middle_center);
                       tft_setTextSize(2);
                       tft_setTextColor(TFT_GREEN);
-                      tft_drawString("Counters Reset!", tft_width() / 2, 40);
+                      tft_drawString("Counter Reset!", tft_width() / 2, 40);
                       tft_setTextSize(1);
                       tft_setTextColor(TFT_YELLOW);
-                      tft_drawString("P:0  V:0", tft_width() / 2, 70);
+                      tft_drawString("P:0", tft_width() / 2, 70);
                       tft_setTextSize(2);
                       tft_setTextColor(TFT_RED);
                       tft_drawString("!! WARNING !!", tft_width() / 2, 110);
@@ -920,7 +751,7 @@ static void taskInput(void *pvParameters) {
                       tft_drawString("Gallery will show wrong", tft_width() / 2, 140);
                       tft_drawString("files after counter reset.", tft_width() / 2, 155);
                       tft_setTextColor(TFT_CYAN);
-                      tft_drawString("Backup your photos/videos", tft_width() / 2, 180);
+                      tft_drawString("Backup your photos", tft_width() / 2, 180);
                       tft_drawString("via WiFi, then delete them", tft_width() / 2, 195);
                       tft_drawString("from SD card.", tft_width() / 2, 210);
                       tft_setTextDatum(top_left);
@@ -959,7 +790,6 @@ static void taskInput(void *pvParameters) {
                 case 7:  val = &camSettings.vflip;              lo = 0;  hi = 1;  break;
                 case 8:  val = &camSettings.jpeg_quality;       lo = 4;  hi = 63; break;
                 case 9:  val = &camSettings.timelapse_interval; break;
-                case 10: val = &camSettings.rec_max_seconds;    break;
                 case 11: val = &camSettings.flashlight_on;      lo = 0;  hi = 1;  break;
                 case 13: val = &camSettings.selftimer_seconds;  break;
                 case 14: val = &camSettings.slideshow_interval; break;
@@ -972,16 +802,6 @@ static void taskInput(void *pvParameters) {
                     /* Timelapse interval: step through presets */
                     static const int p[] = {5, 10, 15, 30, 60, 120, 300, 600};
                     int n = 8, ci = 0;
-                    for (int i = 0; i < n; i++) {
-                      if (p[i] >= *val) { ci = i; break; }
-                      if (i == n - 1) ci = n - 1;
-                    }
-                    if (cw && ci < n - 1) *val = p[ci + 1];
-                    else if (!cw && ci > 0) *val = p[ci - 1];
-                  } else if (settingsIndex == 10) {
-                    /* Rec duration limit: step through presets */
-                    static const int p[] = {0, 30, 60, 120, 300, 600, 900};
-                    int n = 7, ci = 0;
                     for (int i = 0; i < n; i++) {
                       if (p[i] >= *val) { ci = i; break; }
                       if (i == n - 1) ci = n - 1;
@@ -1133,10 +953,8 @@ static void taskCapture(void *pvParameters) {
     {
       AppState cs = appState;
       if (cs == STATE_WIFI_MODE || cs == STATE_MENU_MAIN || cs == STATE_SETTINGS ||
-          cs == STATE_GALLERY_TYPE || cs == STATE_GALLERY_PHOTOS ||
-          cs == STATE_GALLERY_VIDEOS || cs == STATE_DELETE_CONFIRM ||
-          cs == STATE_VIDEO_PLAYING || cs == STATE_TIMELAPSE ||
-          cs == STATE_GALLERY_PHOTO_VIEW || cs == STATE_GALLERY_VIDEO_VIEW ||
+          cs == STATE_GALLERY_PHOTOS || cs == STATE_DELETE_CONFIRM ||
+          cs == STATE_TIMELAPSE || cs == STATE_GALLERY_PHOTO_VIEW ||
           cs == STATE_SLIDESHOW) {
         camWdgLastReset = 0;  /* not in IDLE — reset timer when we return */
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -1145,10 +963,6 @@ static void taskCapture(void *pvParameters) {
     }
 
     /* ── Camera watchdog: periodic soft-reset to prevent AEC/AGC drift ── */
-    /* After long operation in low-light, the OV2640 gain algorithm can drift, */
-    /* causing a greenish/overexposed viewfinder. A silent reinit every 30 s */
-    /* in IDLE mode keeps the sensor anchored without any user-visible impact. */
-    /* Not applied during recording, photo capture, timelapse, or menu states. */
     if (appState == STATE_IDLE) {
       unsigned long now = millis();
       if (camWdgLastReset == 0) {
@@ -1161,7 +975,7 @@ static void taskCapture(void *pvParameters) {
         continue;                                         /* skip this frame's fb_get */
       }
     } else {
-      camWdgLastReset = 0;  /* recording/photo/stopping — re-arm after returning to IDLE */
+      camWdgLastReset = 0;  /* photo/menu — re-arm after returning to IDLE */
     }
 
     /* ---- Handle state transition events ---- */
@@ -1174,112 +988,6 @@ static void taskCapture(void *pvParameters) {
       continue;
     }
 
-    /* START RECORDING */
-    if ((bits & EVT_START_RECORDING) && appState == STATE_IDLE) {
-      xEventGroupClearBits(appEvents, EVT_START_RECORDING | EVT_STOP_RECORDING | EVT_SD_STOP);
-
-      initCamera(VIDEO_MODE, VIDEO_RESOLUTION, REC_JPEG_QUALITY);
-
-      bool started = false;
-      if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-        char path[64];
-        snprintf(path, sizeof(path), "/vid_%d.avi", videoNumber);
-        /* Skip past any existing files (prevents overwrite on NVS counter reset) */
-        while (sd_exists(path)) {
-          videoNumber++;
-          snprintf(path, sizeof(path), "/vid_%d.avi", videoNumber);
-        }
-        serial_printf("Video Start: %s\n", path);
-        videoFile = sd_open_write(path);
-        if (videoFile) {
-          videoNumber++;
-          nvs_write_i32("cnt", "vid", (int32_t)videoNumber);
-          avi_start(videoFile, 10, 480, 320);
-          started = true;
-        } else {
-          serial_println("Video file create failed");
-        }
-        xSemaphoreGive(spiMutex);
-      }
-
-      if (started) {
-        initMicrophone();
-        recPoolWriteIdx = 0;
-        recordingStartTime = millis();
-        /* Turn LED on at recording start (flashlight = steady light, else blink starts in taskRecorder) */
-        if (camSettings.flashlight_on) {
-          digitalWrite(LED_FLASHLIGHT_PIN, HIGH);
-        }
-        appState = STATE_RECORDING;
-        serial_println("Recording started.");
-      }
-
-      if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-        tft_fillScreen(TFT_BLACK);
-        xSemaphoreGive(spiMutex);
-      }
-      continue;
-    }
-
-    /* STOP RECORDING */
-    if ((bits & (EVT_STOP_RECORDING | EVT_SD_STOP)) && appState == STATE_RECORDING) {
-      bool wasSdStop = (bits & EVT_SD_STOP) != 0;
-      xEventGroupClearBits(appEvents, EVT_STOP_RECORDING | EVT_SD_STOP);
-
-      appState = STATE_STOPPING; /* signals audio/recorder to stop, blocks taskDisplay */
-
-      /* wait for recorder queue to drain (max 500ms) */
-      int drainTimeout = 50;
-      while (uxQueueMessagesWaiting(recFrameQueue) > 0 && --drainTimeout > 0) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-      }
-      vTaskDelay(pdMS_TO_TICKS(50)); /* let recorder finish last write */
-
-      deinitMicrophone();
-
-      /* LED off — flashlight is only active during capture/recording */
-      digitalWrite(LED_FLASHLIGHT_PIN, LOW);
-
-      /* close AVI file */
-      if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-        if (videoFile) {
-          avi_end(videoFile, 10, 480, 320);
-          videoFile = NULL;
-        }
-        xSemaphoreGive(spiMutex);
-      }
-
-      /* show saved/error message */
-      if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-        if (wasSdStop) {
-          tft_fillScreen(TFT_BLACK);
-          tft_setTextSize(2);
-          tft_setTextColor(TFT_RED);
-          tft_setCursor(20, 90);
-          tft_print("REC STOPPED");
-          tft_setCursor(20, 120);
-          tft_print(globalSDState.isMounted ? "SD FULL!" : "SD REMOVED!");
-        } else {
-          char msg[32];
-          snprintf(msg, sizeof(msg), "VIDEO SAVED #%d", videoNumber - 1);
-          tft_fillRoundRect(60, 85, 200, 50, 8, TFT_WHITE);
-          tft_drawRoundRect(60, 85, 200, 50, 8, TFT_BLACK);
-          tft_setTextSize(2);
-          tft_setTextColor(TFT_BLACK);
-          tft_setCursor(68, 102);
-          tft_print(msg);
-        }
-        xSemaphoreGive(spiMutex);
-      }
-      serial_println("Recording stopped.");
-
-      vTaskDelay(pdMS_TO_TICKS(1000));  /* keep notification visible */
-
-      initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
-      appState = STATE_IDLE;  /* resume display after notification shown */
-      continue;
-    }
-
     /* ---- Normal frame capture ---- */
     camera_fb_t *fb = esp_camera_fb_get();
 
@@ -1287,19 +995,14 @@ static void taskCapture(void *pvParameters) {
       fail_count++;
       serial_printf("Cam Fail: %d\n", fail_count);
       if (fail_count > 10) {
-        if (appState == STATE_RECORDING) {
-          xEventGroupSetBits(appEvents, EVT_STOP_RECORDING);
-          serial_println("Cam error! Requesting recording stop.");
-        } else {
-          if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-            tft_fillScreen(TFT_RED);
-            tft_setTextSize(2);
-            tft_drawString("CAM RESET...", 20, 110);
-            xSemaphoreGive(spiMutex);
-          }
-          delay(100);
-          initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
+        if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+          tft_fillScreen(TFT_RED);
+          tft_setTextSize(2);
+          tft_drawString("CAM RESET...", 20, 110);
+          xSemaphoreGive(spiMutex);
         }
+        delay(100);
+        initCamera(IDLE_MODE, IDLE_RESOLUTION, IDLE_JPEG_QUALITY);
         fail_count = 0;
       }
       vTaskDelay(10);
@@ -1307,49 +1010,22 @@ static void taskCapture(void *pvParameters) {
     }
     fail_count = 0;
 
-    /* Copy frame for display (double buffer ping-pong) */
-    /* Skip during gallery states — dispBuf is reused for JPEG file decode. */
-    /* Skip if taskDisplay is currently rendering this slot. */
-    {
-      AppState cs = appState;
-      if (cs == STATE_IDLE || cs == STATE_RECORDING) {
-        int ws = atomic_load(&dispWriteSlot);
-        if (ws != atomic_load(&dispRendering) && fb->len <= DISP_BUF_SIZE && dispBuf[ws]) {
-          memcpy(dispBuf[ws], fb->buf, fb->len);
-          dispLen[ws] = fb->len;
-          atomic_store(&dispReadSlot, ws);
+    /* Copy frame for display (single buffer on ESP32-WROOM-32, or ping-pong if 2 slots exist) */
+    if (appState == STATE_IDLE) {
+      int ws = atomic_load(&dispWriteSlot);
+      if (ws != atomic_load(&dispRendering) && fb->len <= dispBufCap && dispBuf[ws]) {
+        memcpy(dispBuf[ws], fb->buf, fb->len);
+        dispLen[ws] = fb->len;
+        atomic_store(&dispReadSlot, ws);
+        if (dispBuf[1 - ws]) {
           atomic_store(&dispWriteSlot, 1 - ws);
-          if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
         }
+        if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
       }
     }
 
-    /* Copy frame for recorder (if recording) */
-    if (appState == STATE_RECORDING && fb->format == PIXFORMAT_JPEG) {
-      if (xSemaphoreTake(recPoolFree, 0) == pdTRUE) {
-        int idx = recPoolWriteIdx;
-        recPoolWriteIdx = (recPoolWriteIdx + 1) % REC_POOL_SIZE;
-        if (recPool[idx] && fb->len <= REC_BUF_SIZE) {
-          memcpy(recPool[idx], fb->buf, fb->len);
-          RecFrame rf = { idx, (size_t)fb->len };
-          xQueueSend(recFrameQueue, &rf, 0);
-        } else {
-          xSemaphoreGive(recPoolFree); /* return slot if copy failed */
-        }
-      }
-    }
-
-    /* Return camera buffer immediately — this is the key to preventing FB-OVF */
+    /* Return camera buffer immediately — prevents frame drop with fb_count=1 in DRAM */
     esp_camera_fb_return(fb);
-
-    /* Auto-stop recording if duration limit is configured and exceeded */
-    if (appState == STATE_RECORDING && camSettings.rec_max_seconds > 0) {
-      unsigned long elapsedSec = (millis() - recordingStartTime) / 1000;
-      if (elapsedSec >= (unsigned long)camSettings.rec_max_seconds) {
-        serial_printf("[REC] Duration limit reached (%ds), auto-stopping.\n", camSettings.rec_max_seconds);
-        xEventGroupSetBits(appEvents, EVT_STOP_RECORDING);
-      }
-    }
 
     vTaskDelay(1);
   }
@@ -1366,38 +1042,28 @@ static void taskDisplay(void *pvParameters) {
     /* wait for a new frame notification (200ms timeout for FPS update even if no frames) */
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
 
-    /* Don't render during photo/stopping/wifi — let notifications stay on screen */
-    if (appState == STATE_PHOTO || appState == STATE_STOPPING || appState == STATE_WIFI_MODE) {
+    /* Don't render during photo/wifi — let notifications stay on screen */
+    if (appState == STATE_PHOTO || appState == STATE_WIFI_MODE) {
       vTaskDelay(pdMS_TO_TICKS(50));
       continue;
     }
 
-    /* Menu and gallery states — render on demand, skip camera preview */
+    /* Menu and photo gallery states — render on demand, skip camera preview */
     if (appState == STATE_MENU_MAIN || appState == STATE_SETTINGS ||
-        appState == STATE_GALLERY_TYPE || appState == STATE_GALLERY_PHOTOS ||
-        appState == STATE_GALLERY_VIDEOS || appState == STATE_DELETE_CONFIRM ||
-        appState == STATE_GALLERY_PHOTO_VIEW || appState == STATE_GALLERY_VIDEO_VIEW) {
+        appState == STATE_GALLERY_PHOTOS || appState == STATE_DELETE_CONFIRM ||
+        appState == STATE_GALLERY_PHOTO_VIEW) {
       if (galleryNeedsRedraw) {
         galleryNeedsRedraw = false;
         switch (appState) {
-          case STATE_MENU_MAIN:           drawMenuMain(); break;
-          case STATE_SETTINGS:            drawSettingsMenu(); break;
-          case STATE_GALLERY_TYPE:        drawGalleryTypeMenu(); break;
-          case STATE_GALLERY_PHOTOS:      drawPhotoGrid(); break;
-          case STATE_GALLERY_VIDEOS:      drawVideoGrid(); break;
-          case STATE_GALLERY_PHOTO_VIEW:  drawGalleryPhotoView(); break;
-          case STATE_GALLERY_VIDEO_VIEW:  drawGalleryVideoView(); break;
-          case STATE_DELETE_CONFIRM:      drawDeleteConfirm(); break;
+          case STATE_MENU_MAIN:          drawMenuMain(); break;
+          case STATE_SETTINGS:           drawSettingsMenu(); break;
+          case STATE_GALLERY_PHOTOS:     drawPhotoGrid(); break;
+          case STATE_GALLERY_PHOTO_VIEW: drawGalleryPhotoView(); break;
+          case STATE_DELETE_CONFIRM:     drawDeleteConfirm(); break;
           default: break;
         }
       }
       vTaskDelay(pdMS_TO_TICKS(50));
-      continue;
-    }
-
-    /* Video playback — blocking render loop until stopped */
-    if (appState == STATE_VIDEO_PLAYING) {
-      playVideoOnTFT();
       continue;
     }
 
@@ -1430,24 +1096,21 @@ static void taskDisplay(void *pvParameters) {
     if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
       tft_startWrite();
 
-      if (appState == STATE_RECORDING) {
-        tft_drawJpg(dispBuf[rs], dispLen[rs], 80, 80, 0, 0, 0, 0, 0.25f);
-
-        /* blinking REC icon */
-        if ((millis() / 500) % 2 == 0) tft_fillCircle(16, 16, 6, TFT_RED);
-        else tft_fillCircle(16, 16, 6, TFT_BLACK);
-
-        /* recording duration */
-        unsigned long elapsed = (millis() - recordingStartTime) / 1000;
-        char timeStr[12];
-        snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d",
-                 (int)(elapsed / 3600), (int)((elapsed % 3600) / 60), (int)(elapsed % 60));
-        tft_setTextSize(2);
-        tft_setTextColorBg(TFT_WHITE, TFT_BLACK);
-        tft_setCursor(30, 6);
-        tft_print(timeStr);
+      /* idle: RGB565 preview (160x120 QQVGA upscaled 2x for WROOM-32 DRAM, or 320x240 QVGA 1:1) */
+      if (dispLen[rs] == (size_t)(160 * 120 * 2)) {
+        uint16_t lineBuf[320];
+        const uint16_t *src = (const uint16_t *)dispBuf[rs];
+        for (int sy = 0; sy < 108; sy++) {
+          const uint16_t *row = src + sy * 160;
+          for (int sx = 0; sx < 160; sx++) {
+            uint16_t px = row[sx];
+            lineBuf[sx * 2]     = px;
+            lineBuf[sx * 2 + 1] = px;
+          }
+          tft_pushImage(0, sy * 2,     320, 1, lineBuf);
+          tft_pushImage(0, sy * 2 + 1, 320, 1, lineBuf);
+        }
       } else {
-        /* idle: RGB565 preview */
         for (int y = 0; y < 216; y++) {
           tft_pushImage(0, y, 320, 1, (const uint16_t *)(dispBuf[rs] + y * 320 * 2));
         }
@@ -1499,72 +1162,6 @@ static void drawStatusBar(float fps) {
   xSemaphoreGive(spiMutex);
 }
 
-/* ================= TASK: AVI RECORDER (Core 0, Priority 4) ================= */
-static void taskRecorder(void *pvParameters) {
-  (void)pvParameters;
-  /* Frame counter for 1 Hz LED blink when flashlight is off. */
-  /* At ~10 FPS, toggling every 5 frames gives ~1 Hz with zero millis() overhead. */
-  int blinkFrameCount = 0;
-  bool ledBlinkState = false;
-
-  while (true) {
-    if (appState != STATE_RECORDING && appState != STATE_STOPPING) {
-      vTaskDelay(pdMS_TO_TICKS(50));
-      continue;
-    }
-
-    RecFrame rf;
-    if (xQueueReceive(recFrameQueue, &rf, pdMS_TO_TICKS(100)) == pdTRUE) {
-      /* ── Recording LED blink (only when flashlight is off) ── */
-      /* Flashlight-on mode: LED was set HIGH at recording start, no work here. */
-      if (appState == STATE_RECORDING && !camSettings.flashlight_on) {
-        blinkFrameCount++;
-        if (blinkFrameCount >= 5) {
-          blinkFrameCount = 0;
-          ledBlinkState = !ledBlinkState;
-          digitalWrite(LED_FLASHLIGHT_PIN, ledBlinkState ? HIGH : LOW);
-        }
-      }
-
-      /* Read exactly one frame's worth of audio from the I2S DMA ring buffer. */
-      size_t audio_bytes_read = 0;
-      if (i2s_rx_handle && audioRecBuf) {
-        i2s_channel_read(i2s_rx_handle, audioRecBuf, AUDIO_BYTES_PER_FRAME,
-                         &audio_bytes_read, 0);
-        if (audio_bytes_read < AUDIO_BYTES_PER_FRAME) {
-          memset((uint8_t *)audioRecBuf + audio_bytes_read, 0,
-                 AUDIO_BYTES_PER_FRAME - audio_bytes_read);
-          audio_bytes_read = AUDIO_BYTES_PER_FRAME;
-        }
-      }
-
-      if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-        if (videoFile) {
-          bool ok = avi_write_frame_from_buf(videoFile, recPool[rf.idx], rf.len);
-          if (ok && audio_bytes_read > 0) {
-            avi_write_audio_chunk(videoFile, (uint8_t *)audioRecBuf, audio_bytes_read);
-          }
-          if (!ok) {
-            serial_println("Write error! Requesting recording stop (SD lost).");
-            xSemaphoreGive(spiMutex);
-            xSemaphoreGive(recPoolFree);
-            xEventGroupSetBits(appEvents, EVT_SD_STOP);
-            while (appState == STATE_RECORDING) {
-              vTaskDelay(pdMS_TO_TICKS(10));
-            }
-            digitalWrite(LED_FLASHLIGHT_PIN, LOW);
-            blinkFrameCount = 0;
-            ledBlinkState = false;
-            continue;
-          }
-        }
-        xSemaphoreGive(spiMutex);
-      }
-      xSemaphoreGive(recPoolFree);
-    }
-  }
-}
-
 /* ================= PHOTO CAPTURE ================= */
 static void savePhotoHighRes(void) {
   appState = STATE_PHOTO;
@@ -1610,9 +1207,23 @@ static void savePhotoHighRes(void) {
     bool saved = false;
     bool writeErr = false;
     bool sdLost = false;
+    uint8_t *jpgBuf = NULL;
+    size_t jpgLen = 0;
+    const uint8_t *jpegData = fb->buf;
+    size_t jpegSize = fb->len;
+
+    if (fb->format != PIXFORMAT_JPEG) {
+      if (!frame2jpg(fb, ov7670_jpeg_quality(camSettings.jpeg_quality), &jpgBuf, &jpgLen)) {
+        serial_println("Software JPEG encode failed!");
+        writeErr = true;
+      } else {
+        jpegData = jpgBuf;
+        jpegSize = jpgLen;
+      }
+    }
 
     /* SD write — separate mutex take to avoid nesting */
-    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    if (!writeErr && xSemaphoreTake(spiMutex, portMAX_DELAY)) {
       if (sd_total_bytes() > 0) {
         char path[64];
         snprintf(path, sizeof(path), "/hd_pic_%d.jpg", pictureNumber);
@@ -1621,7 +1232,7 @@ static void savePhotoHighRes(void) {
           pictureNumber++;
           snprintf(path, sizeof(path), "/hd_pic_%d.jpg", pictureNumber);
         }
-        serial_printf("Saving (%u bytes): %s\n", (unsigned int)fb->len, path);
+        serial_printf("Saving (%u bytes): %s\n", (unsigned int)jpegSize, path);
 
         sd_file_t *file = sd_open_write(path);
         if (file) {
@@ -1630,14 +1241,14 @@ static void savePhotoHighRes(void) {
           size_t exifLen = getExifBlock(&exifData);
           bool writeOk = true;
           /* SOI marker (0xFFD8) */
-          if (sd_file_write(file, fb->buf, 2) != 2) writeOk = false;
+          if (sd_file_write(file, jpegData, 2) != 2) writeOk = false;
           /* EXIF APP1 segment */
           if (writeOk && exifLen > 0 && exifData) {
             if (sd_file_write(file, exifData, exifLen) != exifLen) writeOk = false;
           }
           /* Rest of JPEG (skip SOI) */
-          size_t remaining = fb->len - 2;
-          if (writeOk && sd_file_write(file, fb->buf + 2, remaining) != remaining) writeOk = false;
+          size_t remaining = (jpegSize > 2) ? (jpegSize - 2) : 0;
+          if (writeOk && remaining > 0 && sd_file_write(file, jpegData + 2, remaining) != remaining) writeOk = false;
           sd_file_close(file);
           if (writeOk) {
             serial_println("SUCCESS!");
@@ -1659,6 +1270,7 @@ static void savePhotoHighRes(void) {
       xSemaphoreGive(spiMutex);
     }
 
+    if (jpgBuf) free(jpgBuf);
     esp_camera_fb_return(fb);
 
     /* Show result on TFT — separate mutex take */
@@ -1699,86 +1311,69 @@ static void savePhotoHighRes(void) {
   appState = STATE_IDLE;
 }
 
-/* ================= CAMERA INIT ================= */
+/* Map sensor-style JPEG quality (4=best .. 63=worst) to frame2jpg quality (1..100, higher=best). */
+static uint8_t ov7670_jpeg_quality(int cam_quality) {
+  if (cam_quality <= 4)  return 95;
+  if (cam_quality >= 63) return 15;
+  return (uint8_t)(95 - ((cam_quality - 4) * 80) / 59);
+}
+
+/* ================= CAMERA INIT (ESP32-WROOM-32 + OV7670 V2) ================= */
 void initCamera(pixformat_t format, framesize_t size, int jpeg_quality) {
+  (void)format;
   esp_camera_deinit();
 
-  config.pixel_format = format;
+  /* ESP32-WROOM-32 has NO PSRAM: framebuffers must reside in internal DRAM. */
+  /* Live preview (IDLE_RESOLUTION) uses QQVGA (160x120 = 38.4 KB) so DRAM */
+  /* fits both the camera DMA buffer and dispBuf[0]. Photo capture tries QVGA */
+  /* (320x240 = 153.6 KB) and falls back to HQVGA/QQVGA if DMA heap is tight. */
+  if (size == IDLE_RESOLUTION) {
+    if (size > FRAMESIZE_QQVGA) size = FRAMESIZE_QQVGA;
+  } else if (size > FRAMESIZE_QVGA) {
+    size = FRAMESIZE_QVGA;
+  }
+
+  config.pixel_format = PIXFORMAT_RGB565;
   config.frame_size = size;
   config.jpeg_quality = jpeg_quality;
-  config.fb_count = (format == PIXFORMAT_RGB565) ? 3 : 2;
-  config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.fb_count = 1;
+  config.fb_location = CAMERA_FB_IN_DRAM;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
   if (esp_camera_init(&config) != ESP_OK) {
-    serial_println("Cam init error");
+    if (size > FRAMESIZE_HQVGA) {
+      serial_println("QVGA DRAM init failed, retrying HQVGA...");
+      config.frame_size = FRAMESIZE_HQVGA;
+      if (esp_camera_init(&config) == ESP_OK) goto cam_ready;
+    }
+    if (size > FRAMESIZE_QQVGA) {
+      serial_println("HQVGA DRAM init failed, retrying QQVGA...");
+      config.frame_size = FRAMESIZE_QQVGA;
+      if (esp_camera_init(&config) == ESP_OK) goto cam_ready;
+    }
+    serial_println("OV7670 Cam init error");
     return;
   }
 
+cam_ready:;
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
     applySettings(s);
 
-    /* These are always-on control flags, not user-tuneable. */
-    s->set_whitebal(s, 1);
-    s->set_awb_gain(s, 1);
-    s->set_exposure_ctrl(s, 1);
-    s->set_aec2(s, 1);
-
-    if (format == PIXFORMAT_JPEG)
-      s->set_gainceiling(s, GAINCEILING_16X);
-    else
-      s->set_gainceiling(s, GAINCEILING_2X);  /* IDLE/RGB565: conservative gain reduces green-drift risk */
+    /* Guard every callback — OV7670 leaves several OV2640 hooks (e.g. aec2/awb_gain) NULL. */
+    if (s->set_whitebal)      s->set_whitebal(s, 1);
+    if (s->set_awb_gain)      s->set_awb_gain(s, 1);
+    if (s->set_exposure_ctrl) s->set_exposure_ctrl(s, 1);
+    if (s->set_aec2)          s->set_aec2(s, 1);
+    if (s->set_gain_ctrl)     s->set_gain_ctrl(s, 1);
+    if (s->set_gainceiling)   s->set_gainceiling(s, (config.frame_size > FRAMESIZE_QQVGA) ? GAINCEILING_8X : GAINCEILING_2X);
   }
   delay(100);
 }
 
-/* ================= MICROPHONE ================= */
-void initMicrophone(void) {
-  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-  /* DMA geometry tuned for exact per-frame audio drain: */
-  /*   dma_frame_num=160 -> 160 x 2 bytes = 320 bytes per DMA slot (fills in 10 ms) */
-  /*   AUDIO_BYTES_PER_FRAME (3200) / 320 = 10 slots -> drains in exact multiples */
-  /*   dma_desc_num=16   -> 16 x 320 = 5120 bytes total buffer = 160 ms capacity */
-  chan_cfg.dma_desc_num  = 16;
-  chan_cfg.dma_frame_num = 160;
-  chan_cfg.auto_clear    = true;
-
-  esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &i2s_rx_handle);
-  if (err != ESP_OK) {
-    serial_printf("I2S channel error: %d\n", (int)err);
-    return;
-  }
-
-  i2s_pdm_rx_config_t pdm_rx_cfg = {
-    .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
-    .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
-    .gpio_cfg = {
-      .clk = (gpio_num_t)I2S_MIC_CLK_PIN,
-      .din = (gpio_num_t)I2S_MIC_DATA_PIN,
-      .invert_flags = { .clk_inv = false },
-    },
-  };
-
-  err = i2s_channel_init_pdm_rx_mode(i2s_rx_handle, &pdm_rx_cfg);
-  if (err != ESP_OK) {
-    serial_printf("I2S PDM init error: %d\n", (int)err);
-    i2s_del_channel(i2s_rx_handle);
-    i2s_rx_handle = NULL;
-    return;
-  }
-
-  i2s_channel_enable(i2s_rx_handle);
-  serial_println("Microphone ready.");
-}
-
-void deinitMicrophone(void) {
-  if (i2s_rx_handle) {
-    i2s_channel_disable(i2s_rx_handle);
-    i2s_del_channel(i2s_rx_handle);
-    i2s_rx_handle = NULL;
-  }
-}
+/* ================= MICROPHONE STUBS (Video/Audio removed) ================= */
+void initMicrophone(void) { }
+void deinitMicrophone(void) { }
 
 /* ================= TIMELAPSE MODE ================= */
 /* Runs in taskDisplay context (Core 1). Camera is reinited for HD JPEG. */
@@ -1872,7 +1467,19 @@ static void runTimelapse(void) {
       camera_fb_t *fb = esp_camera_fb_get();
       if (fb) {
         bool saved = false;
-        if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+        uint8_t *jpgBuf = NULL;
+        size_t jpgLen = 0;
+        const uint8_t *jpegData = fb->buf;
+        size_t jpegSize = fb->len;
+        bool jpegReady = true;
+
+        if (fb->format != PIXFORMAT_JPEG) {
+          jpegReady = frame2jpg(fb, ov7670_jpeg_quality(camSettings.jpeg_quality), &jpgBuf, &jpgLen);
+          jpegData = jpgBuf;
+          jpegSize = jpgLen;
+        }
+
+        if (jpegReady && xSemaphoreTake(spiMutex, portMAX_DELAY)) {
           if (globalSDState.isMounted) {
             char path[64];
             snprintf(path, sizeof(path), "/hd_pic_%d.jpg", pictureNumber);
@@ -1886,19 +1493,19 @@ static void runTimelapse(void) {
               const uint8_t *exifData = NULL;
               size_t exifLen = getExifBlock(&exifData);
               bool writeOk = true;
-              if (sd_file_write(file, fb->buf, 2) != 2) writeOk = false;
+              if (sd_file_write(file, jpegData, 2) != 2) writeOk = false;
               if (writeOk && exifLen > 0 && exifData) {
                 if (sd_file_write(file, exifData, exifLen) != exifLen) writeOk = false;
               }
-              size_t rem_bytes = fb->len - 2;
-              if (writeOk && sd_file_write(file, fb->buf + 2, rem_bytes) != rem_bytes) writeOk = false;
+              size_t rem_bytes = (jpegSize > 2) ? (jpegSize - 2) : 0;
+              if (writeOk && rem_bytes > 0 && sd_file_write(file, jpegData + 2, rem_bytes) != rem_bytes) writeOk = false;
               sd_file_close(file);
               if (writeOk) {
                 pictureNumber++;
                 nvs_write_i32("cnt", "pic", (int32_t)pictureNumber);
                 captureCount++;
                 saved = true;
-                serial_printf("[TL] Saved: %s (%u bytes)\n", path, (unsigned int)fb->len);
+                serial_printf("[TL] Saved: %s (%u bytes)\n", path, (unsigned int)jpegSize);
               } else {
                 serial_printf("[TL] Write incomplete (EXIF inject)\n");
               }
@@ -1906,6 +1513,7 @@ static void runTimelapse(void) {
           }
           xSemaphoreGive(spiMutex);
         }
+        if (jpgBuf) free(jpgBuf);
         esp_camera_fb_return(fb);
 
         /* Show save result */
@@ -1992,6 +1600,65 @@ static void runTimelapse(void) {
     xSemaphoreGive(spiMutex);
   }
   appState = STATE_IDLE;
+}
+
+/* ================= SLIDESHOW MODE ================= */
+/* Runs in taskDisplay context while taskCapture is paused for menu states. */
+static void runSlideshow(void) {
+  scanGalleryFiles(false);
+  if (appState != STATE_SLIDESHOW) return;
+
+  if (galleryFileCount <= 0) {
+    appState = STATE_MENU_MAIN;
+    showTFTMessage("NO PHOTOS FOUND", TFT_RED, 1500);
+    if (appState == STATE_MENU_MAIN) {
+      galleryNeedsRedraw = true;
+      if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+    }
+    return;
+  }
+
+  int interval = camSettings.slideshow_interval;
+  if (interval < 1) interval = 5;
+  uint32_t intervalMs = (uint32_t)interval * 1000U;
+  bool paused = false;
+  galleryIndex = 0;
+  unsigned long lastSlideTime = millis();
+  drawGalleryPhotoView();
+
+  while (appState == STATE_SLIDESHOW) {
+    InputEvent ev;
+    while (xQueueReceive(inputEventQueue, &ev, 0) == pdTRUE) {
+      if (appState != STATE_SLIDESHOW) return;
+
+      if (ev.type == INPUT_ENC_CW || ev.type == INPUT_ENC_CCW) {
+        int direction = (ev.type == INPUT_ENC_CW) ? 1 : -1;
+        galleryIndex = (galleryIndex + direction + galleryFileCount) % galleryFileCount;
+        drawGalleryPhotoView();
+        lastSlideTime = millis();
+      } else if (ev.type == INPUT_ENC_CLICK) {
+        paused = !paused;
+        lastSlideTime = millis();
+      } else if (ev.type == INPUT_ENC_LONG) {
+        freeGalleryFiles();
+        appState = STATE_MENU_MAIN;
+        galleryNeedsRedraw = true;
+        if (taskDisplayHandle) xTaskNotifyGive(taskDisplayHandle);
+        return;
+      }
+    }
+
+    if (appState != STATE_SLIDESHOW) return;
+
+    unsigned long now = millis();
+    if (!paused && now - lastSlideTime >= intervalMs) {
+      galleryIndex = (galleryIndex + 1) % galleryFileCount;
+      drawGalleryPhotoView();
+      lastSlideTime = now;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
 }
 
 /* ================= SELF-TIMER COUNTDOWN ================= */
